@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>迟暮的泪 · 空间记忆触发原型</title>
+    <style>
+        body { font-family: sans-serif; margin: 0; overflow: hidden; background: #111; color: white; }
+        #info {
+            position: absolute;
+            bottom: 20px;
+            left: 20px;
+            background: rgba(0,0,0,0.7);
+            padding: 10px 15px;
+            border-radius: 20px;
+            z-index: 10;
+            pointer-events: none;
+            font-size: 14px;
+        }
+        #controls {
+            position: absolute;
+            bottom: 20px;
+            right: 20px;
+            background: rgba(0,0,0,0.7);
+            padding: 12px;
+            border-radius: 40px;
+            z-index: 20;
+            display: flex;
+            gap: 10px;
+            pointer-events: auto;
+        }
+        button {
+            background: #ffaa44;
+            border: none;
+            padding: 8px 16px;
+            border-radius: 30px;
+            font-weight: bold;
+            cursor: pointer;
+        }
+        button.record { background: #ff4444; color: white; }
+        .status {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            background: rgba(0,0,0,0.6);
+            padding: 8px 12px;
+            border-radius: 8px;
+            font-size: 12px;
+            z-index: 10;
+        }
+        @keyframes pulse {
+            0% { opacity: 0.6; }
+            100% { opacity: 1; text-shadow: 0 0 5px white; }
+        }
+        .recall-active {
+            animation: pulse 0.5s ease-in-out infinite alternate;
+            color: #ffaa44;
+        }
+    </style>
+</head>
+<body>
+    <div id="info">📍 空间记忆原型 | 走近你录制的位置 → 自动播放回忆</div>
+    <div id="controls">
+        <button id="recordBtn" class="record">📹 录制当前记忆</button>
+        <button id="clearBtn">🗑️ 清除所有记忆</button>
+    </div>
+    <div id="status" class="status">⚪ 等待位置许可</div>
+
+    <script>
+        // ------------------- 简单的本地存储 (基于 localStorage) -------------------
+        let memories = [];   // 每个元素: { lat, lng, radius(米), audioDataURI, textLabel, timestamp }
+
+        // 加载已有记忆
+        function loadMemories() {
+            const raw = localStorage.getItem('tears_memories');
+            if (raw) {
+                try {
+                    memories = JSON.parse(raw);
+                    updateStatus(`📀 已加载 ${memories.length} 段记忆`);
+                } catch(e) { memories = []; }
+            }
+        }
+
+        function saveMemories() {
+            localStorage.setItem('tears_memories', JSON.stringify(memories));
+        }
+
+        // 录制新记忆
+        async function recordMemory() {
+            if (!navigator.geolocation) {
+                alert("浏览器不支持地理位置");
+                return;
+            }
+            // 获取当前位置
+            navigator.geolocation.getCurrentPosition(async (pos) => {
+                const lat = pos.coords.latitude;
+                const lng = pos.coords.longitude;
+                const accuracy = pos.coords.accuracy || 10; // 大概误差，作为默认半径
+                const radius = Math.min(50, Math.max(15, accuracy * 1.5)); // 半径15-50米
+
+                // 提示用户输入一段文本作为回忆内容
+                const textLabel = prompt("输入你的回忆（一句话）：", "那年夏天，在这里...");
+                if (!textLabel) return;
+
+                // 尝试录音（可选）
+                let audioDataURI = null;
+                if (confirm("是否要录制一段语音？(取消则只保存文字)")) {
+                    try {
+                        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                        const mediaRecorder = new MediaRecorder(stream);
+                        const chunks = [];
+                        mediaRecorder.ondataavailable = e => chunks.push(e.data);
+                        mediaRecorder.onstop = () => {
+                            const blob = new Blob(chunks, { type: 'audio/webm' });
+                            const reader = new FileReader();
+                            reader.onloadend = () => {
+                                audioDataURI = reader.result;
+                                finalizeMemory(lat, lng, radius, textLabel, audioDataURI);
+                            };
+                            reader.readAsDataURL(blob);
+                            stream.getTracks().forEach(t => t.stop());
+                        };
+                        mediaRecorder.start();
+                        setTimeout(() => mediaRecorder.stop(), 8000); // 最长8秒
+                        alert("开始录音... 8秒后自动停止");
+                    } catch(e) { alert("麦克风权限未允许"); }
+                } else {
+                    finalizeMemory(lat, lng, radius, textLabel, null);
+                }
+            }, (err) => {
+                alert("获取位置失败: " + err.message);
+            });
+        }
+
+        function finalizeMemory(lat, lng, radius, text, audioURI) {
+            const newMem = {
+                lat, lng, radius,
+                textLabel: text,
+                audioDataURI: audioURI,
+                timestamp: Date.now()
+            };
+            memories.push(newMem);
+            saveMemories();
+            updateStatus(`✅ 记忆已录制: ${text} (半径${Math.round(radius)}米)`);
+            // 可选：立即在地图上显示标记（本原型仅文字反馈）
+        }
+
+        function clearAllMemories() {
+            if (confirm("删除所有本地记忆？不可恢复。")) {
+                memories = [];
+                saveMemories();
+                updateStatus("🗑️ 所有记忆已清除");
+            }
+        }
+
+        function updateStatus(msg) {
+            const div = document.getElementById('status');
+            div.innerHTML = msg;
+            setTimeout(() => {
+                if (div.innerHTML === msg) div.innerHTML = "🟢 正在监测位置...";
+            }, 3000);
+        }
+
+        // 监测当前位置，触发最近记忆
+        let lastTriggeredId = null;
+        function startGeofencing() {
+            if (!navigator.geolocation) return;
+            // 使用 watchPosition
+            navigator.geolocation.watchPosition((pos) => {
+                const curLat = pos.coords.latitude;
+                const curLng = pos.coords.longitude;
+                let closestDist = Infinity;
+                let triggered = null;
+                for (let mem of memories) {
+                    const dx = (curLat - mem.lat) * 111000;  // 粗略米转换
+                    const dy = (curLng - mem.lng) * 85000;   // 纬度不同转换系数不同，仅演示
+                    const dist = Math.sqrt(dx*dx + dy*dy);
+                    if (dist < mem.radius && dist < closestDist) {
+                        closestDist = dist;
+                        triggered = mem;
+                    }
+                }
+                if (triggered && lastTriggeredId !== triggered.timestamp) {
+                    lastTriggeredId = triggered.timestamp;
+                    // 触发回忆！
+                    const statusDiv = document.getElementById('status');
+                    statusDiv.innerHTML = `✨ 触发回忆: ${triggered.textLabel} ✨`;
+                    statusDiv.classList.add('recall-active');
+                    setTimeout(() => statusDiv.classList.remove('recall-active'), 2000);
+                    // 播放语音
+                    if (triggered.audioDataURI) {
+                        const audio = new Audio(triggered.audioDataURI);
+                        audio.play().catch(e => console.warn);
+                    } else {
+                        // 用文字转语音读出
+                        const utterance = new SpeechSynthesisUtterance(triggered.textLabel);
+                        utterance.lang = 'zh-CN';
+                        window.speechSynthesis.cancel();
+                        window.speechSynthesis.speak(utterance);
+                    }
+                    // 可选：在屏幕上显示一个叠加的AR提示（简易）
+                    showARMessage(triggered.textLabel);
+                } else if (!triggered) {
+                    lastTriggeredId = null;
+                }
+                // 更新状态显示附近记忆数
+                const nearbyCount = memories.filter(m => {
+                    const dx = (curLat - m.lat) * 111000;
+                    const dy = (curLng - m.lng) * 85000;
+                    return Math.sqrt(dx*dx + dy*dy) < 100;
+                }).length;
+                if (nearbyCount > 0 && !triggered) {
+                    statusDiv.innerHTML = `📍 附近有 ${nearbyCount} 段记忆，再走近一点～`;
+                }
+            }, (err) => {
+                console.warn(err);
+                updateStatus("❌ 位置监测失败，请允许定位权限");
+            }, {
+                enableHighAccuracy: true,
+                maximumAge: 5000,
+                timeout: 10000
+            });
+        }
+
+        function showARMessage(text) {
+            // 简单的大字提示，后续可扩展为3D文字
+            const div = document.createElement('div');
+            div.innerText = text;
+            div.style.position = 'absolute';
+            div.style.bottom = '30%';
+            div.style.left = '10%';
+            div.style.width = '80%';
+            div.style.background = 'rgba(0,0,0,0.8)';
+            div.style.color = '#ffcc88';
+            div.style.padding = '16px';
+            div.style.borderRadius = '30px';
+            div.style.textAlign = 'center';
+            div.style.fontSize = '1.5rem';
+            div.style.zIndex = '100';
+            div.style.backdropFilter = 'blur(10px)';
+            document.body.appendChild(div);
+            setTimeout(() => div.remove(), 5000);
+        }
+
+        // 初始化
+        loadMemories();
+        document.getElementById('recordBtn').onclick = recordMemory;
+        document.getElementById('clearBtn').onclick = clearAllMemories;
+        // 请求位置权限后开始监测
+        if (navigator.geolocation) {
+            navigator.geolocation.getCurrentPosition(() => {
+                startGeofencing();
+                updateStatus("🟢 正在监测位置...");
+            }, (err) => {
+                updateStatus("⚠️ 请授予位置权限以获得完整体验");
+            });
+        } else {
+            updateStatus("❌ 浏览器不支持地理位置");
+        }
+    </script>
+</body>
+</html>
